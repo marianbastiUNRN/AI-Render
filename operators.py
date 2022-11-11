@@ -1,6 +1,8 @@
 import bpy
 import functools
+import math
 import random
+import re
 import time
 
 from . import (
@@ -201,7 +203,37 @@ def generate_new_random_seed(scene):
         props.seed = random.randint(1000000000, 2147483647)
 
 
-def render_frame(context, current_frame):
+def ensure_animated_prompts_text():
+    text = utils.get_animated_prompt_text_data_block()
+    if text:
+        text.select_set(0, 0, -1, -1)
+    else:
+        text = bpy.data.texts.new(config.animated_prompts_text_name)
+        text.write("1: Stable Diffusion Prompt starting at frame 1\n")
+        text.write("30: Stable Diffusion Prompt starting at frame 30\n")
+        text.write("# etc...\n")
+        text.select_set(0, 3, 0, -1)
+
+
+def ensure_animated_prompts_text_editor_in_workspace(context):
+    script_area = utils.get_area_by_type('TEXT_EDITOR', workspace_id=config.workspace_id)
+
+    if not script_area:
+        area = utils.get_area_by_type('NODE_EDITOR', workspace_id=config.workspace_id)
+        if area is None:
+            area = utils.get_area_by_type('IMAGE_EDITOR', workspace_id=config.workspace_id)
+        if area is None:
+            return handle_error("Couldn't find the right areas in the AI Render workspace. Please re-enable AI Render.")
+
+        utils.split_area(context, area, factor=0.3)
+
+        script_area = utils.get_smallest_area_by_type(area.type, workspace_id=config.workspace_id)
+        script_area.type = 'TEXT_EDITOR'
+
+    script_area.spaces[0].text = utils.get_animated_prompt_text_data_block()
+
+
+def render_frame(context, current_frame, prompt):
     """Render the current frame as part of an animation"""
     # set the frame
     context.scene.frame_set(current_frame)
@@ -210,7 +242,7 @@ def render_frame(context, current_frame):
     bpy.ops.render.render()
 
     # post to the api
-    return send_to_api(context.scene)
+    return send_to_api(context.scene, prompt)
 
 
 def save_render_to_file(scene, filename_prefix):
@@ -296,14 +328,14 @@ def do_pre_api_setup(scene):
     activate_air_workspace(scene)
 
 
-def validate_params(scene):
+def validate_params(scene, prompt=None):
     if utils.get_api_key().strip() == "" and not utils.do_use_local_sd():
         return handle_error("You must enter an API Key to render with Stable Diffusion", "api_key")
     if not utils.are_dimensions_valid(scene):
         return handle_error("Please set width and height to valid values", "dimensions")
     if utils.are_dimensions_too_large(scene):
         return handle_error("Image dimensions are too large. Please decrease width and/or height", "dimensions")
-    if get_full_prompt(scene) == "":
+    if prompt == "":
         return handle_error("Please enter a prompt for Stable Diffusion", "prompt")
     return True
 
@@ -320,9 +352,12 @@ def validate_animation_output_path(scene):
         return True
 
 
-def get_full_prompt(scene):
+def get_full_prompt(scene, prompt=None):
     props = scene.air_props
-    prompt = props.prompt_text.strip()
+
+    if prompt is None:
+        prompt = props.prompt_text.strip()
+
     if prompt == config.default_prompt_text:
         prompt = ""
     if props.use_preset:
@@ -333,12 +368,64 @@ def get_full_prompt(scene):
     return prompt
 
 
-def send_to_api(scene):
+def get_prompt_at_frame(animated_prompts, frame):
+    for line in reversed(animated_prompts):
+        if line['start_frame'] <= frame:
+            return line['prompt']
+    return ""
+
+
+def validate_and_process_animated_prompt_text(scene):
+    text_data = utils.get_animated_prompt_text_data_block()
+    if text_data is None:
+        return handle_error("Animated prompt text does not exist. Please edit animated prompts.")
+
+    lines = text_data.as_string().splitlines()
+    lines = [line.strip() for line in lines]
+
+    r = re.compile('^(\d+):(.*)')
+    lines = list(filter(r.match, lines))
+
+    processed_lines = []
+    for line in lines:
+        m = r.match(line)
+        if m:
+            start_frame = int(m.group(1))
+            prompt = m.group(2).strip()
+            processed_lines.append({'start_frame': start_frame, 'prompt': get_full_prompt(scene, prompt=prompt)})
+
+    processed_lines = list(filter(lambda x: x['prompt'] != "", processed_lines))
+
+    if len(processed_lines) == 0:
+        return handle_error(f"Animated Prompt text is empty or invalid. [Get help with animated prompts]({config.HELP_WITH_ANIMATED_PROMPTS_URL})")
+
+    processed_lines.sort(key=lambda x: x['start_frame'])
+    processed_lines[0]['start_frame'] = 1 # ensure the first frame is 1
+
+    return processed_lines
+
+
+def validate_and_process_animated_prompt_text_for_single_frame(scene, frame):
+    processed_lines = validate_and_process_animated_prompt_text(scene)
+    if not processed_lines:
+        return False
+    else:
+        return get_prompt_at_frame(processed_lines, frame)
+
+
+def send_to_api(scene, prompt=None):
     """Post to the API and process the resulting image"""
     props = scene.air_props
 
+    # get the prompt if we haven't been given one
+    if not prompt:
+        if scene.air_props.use_animated_prompts:
+            prompt = validate_and_process_animated_prompt_text_for_single_frame(scene, scene.frame_current)
+        else:
+            prompt = get_full_prompt(scene)
+
     # validate the parameters we will send
-    if not validate_params(scene):
+    if not validate_params(scene, prompt):
         return False
 
     # generate a new seed, if we want a random one
@@ -367,7 +454,7 @@ def send_to_api(scene):
 
     # prepare data for the API request
     params = {
-        "prompt": get_full_prompt(scene),
+        "prompt": prompt,
         "width": utils.get_output_width(scene),
         "height": utils.get_output_height(scene),
         "image_similarity": props.image_similarity,
@@ -515,6 +602,30 @@ class AIR_OT_show_other_dimension_options(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class AIR_OT_copy_preset_text(bpy.types.Operator):
+    "Copy preset text to clipboard"
+    bl_idname = "ai_render.copy_preset_text"
+    bl_label = "Copy Preset Text"
+
+    def execute(self, context):
+        context.window_manager.clipboard = context.scene.air_props.preset_style
+        self.report({'INFO'}, "Preset text copied to clipboard")
+        return {'FINISHED'}
+
+
+class AIR_OT_edit_animated_prompts(bpy.types.Operator):
+    "Show the animated prompts panel, and focus it"
+    bl_idname = "ai_render.edit_animated_prompts"
+    bl_label = "Edit Animated Prompts"
+
+    def execute(self, context):
+        ensure_animated_prompts_text()
+        utils.activate_workspace(workspace_id=config.workspace_id)
+        task_queue.add(functools.partial(ensure_animated_prompts_text_editor_in_workspace, context))
+
+        return {'FINISHED'}
+
+
 class AIR_OT_generate_new_image_from_render(bpy.types.Operator):
     "Generate a new Stable Diffusion image - without re-rendering - from the last rendered image"
     bl_idname = "ai_render.generate_new_image_from_render"
@@ -555,8 +666,32 @@ class AIR_OT_render_animation(bpy.types.Operator):
     _finished = True
     _start_frame = 0
     _end_frame = 0
+    _frame_step = 1
     _current_frame = 0
     _orig_current_frame = 0
+    _animated_prompts = None
+    _static_prompt = None
+
+    def _pre_render(self, context):
+        scene = context.scene
+
+        # do validation and setup
+        if validate_params(scene) and validate_animation_output_path(scene):
+            do_pre_render_setup(scene)
+            do_pre_api_setup(scene)
+        else:
+            return False
+
+        # validate and process the animated prompts, if we are using them
+        if context.scene.air_props.use_animated_prompts:
+            self._animated_prompts = validate_and_process_animated_prompt_text(context.scene)
+            if not self._animated_prompts:
+                return False
+        else:
+            self._animated_prompts = None
+            self._static_prompt = get_full_prompt(context.scene)
+
+        return True
 
     def _start_render(self, context):
         self._finished = False
@@ -564,6 +699,7 @@ class AIR_OT_render_animation(bpy.types.Operator):
         self._orig_current_frame = context.scene.frame_current
         self._start_frame = context.scene.frame_start
         self._end_frame = context.scene.frame_end
+        self._frame_step = context.scene.frame_step
         self._current_frame = context.scene.frame_start
         context.scene.air_props.is_rendering_animation_manually = True
 
@@ -587,7 +723,7 @@ class AIR_OT_render_animation(bpy.types.Operator):
         context.window_manager.event_timer_remove(self._timer)
 
     def _advance_frame(self, context):
-        self._current_frame += 1
+        self._current_frame += self._frame_step
         if self._current_frame > context.scene.frame_end:
             self._end_render(context, "Animation Render Complete")
 
@@ -596,10 +732,10 @@ class AIR_OT_render_animation(bpy.types.Operator):
         self.report({'INFO'}, "AI Render animation completed")
 
     def _get_total_frames(self):
-        return self._end_frame - self._start_frame + 1
+        return math.floor(((self._end_frame - self._start_frame) / self._frame_step) + 1)
 
     def _get_completed_frames(self):
-        return self._current_frame - self._start_frame
+        return math.floor((self._current_frame - self._start_frame) / self._frame_step)
 
     def _get_completed_percent(self):
         return round(self._get_completed_frames() / self._get_total_frames(), 2)
@@ -624,7 +760,12 @@ class AIR_OT_render_animation(bpy.types.Operator):
                 self._ticks_since_last_render = 0
 
             # render the current frame
-            was_successful = render_frame(context, self._current_frame)
+            if context.scene.air_props.use_animated_prompts:
+                prompt = get_prompt_at_frame(self._animated_prompts, self._current_frame)
+            else:
+                prompt = self._static_prompt
+
+            was_successful = render_frame(context, self._current_frame, prompt)
 
             # if the render was successful, advance to the next frame.
             # otherwise, quit here with an error.
@@ -655,15 +796,11 @@ class AIR_OT_render_animation(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
     def execute(self, context):
-        scene = context.scene
-
-        if validate_params(scene) and validate_animation_output_path(scene):
-            do_pre_render_setup(scene)
-            do_pre_api_setup(scene)
-            self._start_render(context)
-            return {'RUNNING_MODAL'}
-        else:
+        if not self._pre_render(context):
             return {'CANCELLED'}
+
+        self._start_render(context)
+        return {'RUNNING_MODAL'}
 
 
 class AIR_OT_setup_instructions_popup(bpy.types.Operator):
@@ -735,6 +872,8 @@ classes = [
     AIR_OT_enable,
     AIR_OT_set_valid_render_dimensions,
     AIR_OT_show_other_dimension_options,
+    AIR_OT_copy_preset_text,
+    AIR_OT_edit_animated_prompts,
     AIR_OT_generate_new_image_from_render,
     AIR_OT_generate_new_image_from_current,
     AIR_OT_render_animation,

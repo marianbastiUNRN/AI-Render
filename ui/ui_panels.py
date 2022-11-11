@@ -1,4 +1,5 @@
 import bpy
+import math
 from .. import (
     addon_updater_ops,
     config,
@@ -149,24 +150,39 @@ class AIR_PT_prompt(bpy.types.Panel):
         show_error_if_it_exists(layout, context, width_guess)
 
         # Prompt
-        row = layout.row()
-        row.label(text="Prompt:")
+        if props.use_animated_prompts:
+            row = layout.row()
+            row.label(text="You are using animated prompts")
 
-        row = layout.row()
-        row.scale_y = 1.8
-        row.prop(props, "prompt_text", text="")
+            row = layout.row()
+            row.operator(operators.AIR_OT_edit_animated_prompts.bl_idname)
+
+            layout.separator()
+
+        else:
+            row = layout.row()
+            row.label(text="Prompt:")
+
+            row = layout.row()
+            row.scale_y = 1.8
+            row.prop(props, "prompt_text", text="")
 
         # Preset Styles
         box = layout.box()
         row = box.row()
-        row.prop(props, "use_preset")
+        label = "Apply a Preset Style (to All Prompts)" if props.use_animated_prompts else "Apply a Preset Style"
+        row.prop(props, "use_preset", text=label)
 
         if props.use_preset:
             row = box.row()
             row.template_icon_view(props, "preset_style", show_labels=True, scale_popup=7.7)
 
             row = box.row()
-            row.label(text=f"\"{props.preset_style}\"")
+            col = row.column()
+            col.label(text=f"\"{props.preset_style}\"")
+
+            col = row.column()
+            col.operator(operators.AIR_OT_copy_preset_text.bl_idname, text="", icon="COPYDOWN")
 
 
 class AIR_PT_advanced_options(bpy.types.Panel):
@@ -305,12 +321,30 @@ class AIR_PT_animation(bpy.types.Panel):
 
         # Render Animation
         row = layout.row()
-        row.operator(operators.AIR_OT_render_animation.bl_idname, icon="RENDER_ANIMATION")
-        row.enabled = props.animation_output_path != ""
+        is_animation_enabled_button_enabled = props.animation_output_path != ""
+        if is_animation_enabled_button_enabled:
+            num_frames = math.floor(((scene.frame_end - scene.frame_start) / scene.frame_step) + 1)
+            frame_or_frames = "Frame" if num_frames == 1 else "Frames"
+            render_animation_text = f"Render Animation ({num_frames} {frame_or_frames})"
+        else:
+            render_animation_text = "Render Animation"
+
+        row.operator(operators.AIR_OT_render_animation.bl_idname, icon="RENDER_ANIMATION", text=render_animation_text)
+        row.enabled = is_animation_enabled_button_enabled
 
         # Path
         row = layout.row()
         row.prop(props, "animation_output_path", text="Path")
+
+        # Animated Prompts
+        layout.separator()
+
+        row = layout.row()
+        row.prop(props, "use_animated_prompts", text="Use Animated Prompts")
+
+        if props.use_animated_prompts:
+            row = layout.row()
+            row.operator(operators.AIR_OT_edit_animated_prompts.bl_idname)
 
         # Tips
         if round(props.image_similarity, 2) < 0.7 and not props.close_animation_tips:
